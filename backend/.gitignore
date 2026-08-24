@@ -1,0 +1,16 @@
+# Local env — copy from .env.example and fill in values
+.env
+
+# Firebase private key (never commit)
+firebase-service-account.json
+*-firebase-adminsdk-*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env.local
+
+# Locally cloned voices (XTTS speaker embeddings)
+data/

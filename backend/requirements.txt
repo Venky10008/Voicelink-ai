@@ -1,0 +1,17 @@
+fastapi>=0.115.6
+uvicorn[standard]>=0.34.0
+httpx>=0.28.1
+python-dotenv>=1.0.1
+firebase-admin>=6.6.0
+pydantic>=2.11.0
+sqlalchemy[asyncio]>=2.0.36
+asyncpg>=0.30.0
+python-multipart>=0.0.20
+faster-whisper>=1.1.0
+edge-tts>=7.2.0
+# Chatterbox TTS (free, open-source voice cloning, MIT licensed)
+chatterbox-tts>=0.1.7
+torch>=2.0.0
+torchaudio>=2.0.0
+# Note: First run of faster-whisper with large-v3-turbo downloads ~809 MB model
+# For better Telugu/Indian language accuracy, use large-v3-turbo instead of small
