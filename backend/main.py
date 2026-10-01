@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -76,7 +77,7 @@ from voice_service import (
     transcribe_audio,
     transcribe_audio_groq,
 )
-from voice_call_ws import handle_voice_call, resolve_voice_config
+from voice_call_ws import DEMO_MODE, handle_voice_call, resolve_voice_config
 from voice_sharing_router import router as voice_sharing_router
 
 FIREBASE_CREDENTIALS_PATH = os.getenv(
@@ -90,11 +91,38 @@ def _init_firebase() -> None:
     if firebase_admin._apps:
         return
 
+    # Option 1 (preferred for cloud hosts like Hugging Face Spaces / Render):
+    # the service account JSON pasted into the FIREBASE_CREDENTIALS_JSON
+    # environment variable. Secret managers can't create files, and the JSON
+    # must never be committed to git.
+    inline_json = os.getenv("FIREBASE_CREDENTIALS_JSON", "").strip()
+    if inline_json:
+        try:
+            # Tolerate a pasted value wrapped in quotes by a dashboard UI.
+            # NOTE: do NOT unescape "\n" here — a real service-account JSON pasted
+            # as-is already contains valid "\n" escapes inside the "private_key"
+            # string, and rewriting them to literal newlines makes it unparseable.
+            cleaned = inline_json
+            if cleaned.startswith('"') and cleaned.endswith('"'):
+                cleaned = cleaned[1:-1]
+            payload = json.loads(cleaned)
+        except Exception as exc:
+            raise RuntimeError(
+                "FIREBASE_CREDENTIALS_JSON is set but is not valid JSON: "
+                f"{exc}"
+            ) from exc
+        cred = credentials.Certificate(payload)
+        firebase_admin.initialize_app(cred)
+        return
+
+    # Option 2 (local dev): a JSON file on disk.
     cred_path = Path(FIREBASE_CREDENTIALS_PATH)
     if not cred_path.is_file():
         raise RuntimeError(
             f"Firebase credentials file not found at '{cred_path}'. "
-            "Set FIREBASE_CREDENTIALS_PATH in .env to your service account JSON."
+            "Set FIREBASE_CREDENTIALS_PATH in .env to your service account JSON, "
+            "or set FIREBASE_CREDENTIALS_JSON to the JSON contents directly "
+            "(this is what cloud hosts like Hugging Face Spaces use)."
         )
 
     cred = credentials.Certificate(str(cred_path))
@@ -103,21 +131,37 @@ def _init_firebase() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global _db_ready
     try:
         _init_firebase()
     except Exception as exc:
         print(f"[startup] Firebase init failed: {exc}")
 
+    async def _init_db_background() -> None:
+        global _db_ready
+        try:
+            await init_db()
+            _db_ready = True
+            print("[startup] Database tables ready.")
+        except Exception as exc:
+            _db_ready = False
+            print(f"[startup] Database init failed: {exc}")
+
+    # Never hold the demo boot hostage to a slow or unreachable database: give
+    # init a short grace period, then start serving while it finishes in the
+    # background (DEMO_MODE's SQLite fallback lands within a few seconds).
+    init_task = asyncio.create_task(_init_db_background())
     try:
-        await init_db()
-        _db_ready = True
-        print("[startup] Database tables ready.")
-    except Exception as exc:
-        _db_ready = False
-        print(f"[startup] Database init failed: {exc}")
+        await asyncio.wait_for(asyncio.shield(init_task), timeout=3.0)
+    except asyncio.TimeoutError:
+        print(
+            "[startup] Database init still running — serving now, "
+            "it will finish in the background."
+        )
 
     yield
+
+    if not init_task.done():
+        init_task.cancel()
 
 
 app = FastAPI(title="VoiceLink AI", version="0.3.0", lifespan=lifespan)
@@ -301,21 +345,27 @@ async def health(db: AsyncSession = Depends(get_db)) -> dict:
         except Exception:
             db_ok = False
 
-    # Check which voice cloning engine is available
-    voice_clone_status = "not installed (falls back to edge-tts)"
-    if chatterbox_engine_available():
-        voice_clone_status = "chatterbox (local, free, 23+ languages)"
-    elif xtts_engine_available():
-        voice_clone_status = "xtts-v2 (local, free)"
+    # Check which voice cloning engine is available. In DEMO_MODE the cloning
+    # engines are deliberately never touched (every reply goes through Edge
+    # TTS), so skip the availability probes entirely — startup stays instant.
+    if DEMO_MODE:
+        voice_clone_status = "demo mode — edge-tts only (cloning engines skipped)"
+    else:
+        voice_clone_status = "not installed (falls back to edge-tts)"
+        if chatterbox_engine_available():
+            voice_clone_status = "chatterbox (local, free, 23+ languages)"
+        elif xtts_engine_available():
+            voice_clone_status = "xtts-v2 (local, free)"
 
     return {
         "status": "ok",
+        "demo_mode": DEMO_MODE,
         "firebase_ready": bool(firebase_admin._apps),
         "groq_key_set": bool(GROQ_API_KEY),
         "tts_engine": "edge-tts (free, no API key)",
         "voice_clone_engine": voice_clone_status,
-        "chatterbox_available": chatterbox_engine_available(),
-        "xtts_available": xtts_engine_available(),
+        "chatterbox_available": False if DEMO_MODE else chatterbox_engine_available(),
+        "xtts_available": False if DEMO_MODE else xtts_engine_available(),
         "database_ready": db_ok,
     }
 

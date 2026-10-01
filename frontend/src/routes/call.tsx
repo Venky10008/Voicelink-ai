@@ -40,6 +40,8 @@ type CallConfig = {
   voice_profile_id?: number;
   voice_id?: string;
   personality?: string;
+  /** Reply language lock ("en"/"hi"/"te"/"ta") — backend auto-detects when unset. */
+  language?: string;
 };
 
 // --- Hands-free call tuning (continuous VAD + barge-in) --------------------
@@ -47,8 +49,12 @@ const VAD_TICK_MS = 100; // how often we sample the mic level
 const RECORDER_TIMESLICE_MS = 200; // MediaRecorder chunk size
 
 /** Best supported webm flavour (browser-only — do not call during SSR). */
-const recorderMime = () =>
-  MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+const recorderMime = () => {
+  if (typeof MediaRecorder === "undefined") return "audio/webm";
+  return MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+    ? "audio/webm;codecs=opus"
+    : "audio/webm";
+};
 const VAD_RMS_THRESHOLD = 0.02;        // volume level that counts as "speaking"
 const VAD_BARGE_IN_THRESHOLD = 0.05;   // higher bar while the AI is talking (echo) — raised to reduce false barge-ins
 const VAD_ONSET_FRAMES = 3;            // frames of voice to declare speech start (was 2)
@@ -326,7 +332,12 @@ function CallPage({ initialTranscript = [] as Caption[] }: { initialTranscript?:
       } catch {
         return;
       }
-      handleWsEvent(payload);
+      // A handler bug must never break the socket callback mid-call.
+      try {
+        handleWsEvent(payload);
+      } catch (err) {
+        console.error("[voice-call] failed to handle server event", err);
+      }
     };
     ws.onclose = () => {
       if (wsRef.current === ws) wsRef.current = null;
@@ -419,7 +430,15 @@ function CallPage({ initialTranscript = [] as Caption[] }: { initialTranscript?:
     }
     const chunks: Blob[] = [];
     let shouldSend = false;
-    const recorder = new MediaRecorder(stream, { mimeType: recorderMime() });
+    // Creating a recorder can throw in unsupported browsers — a failed
+    // recorder must never take the call down.
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream, { mimeType: recorderMime() });
+    } catch (err) {
+      console.error("[voice-call] MediaRecorder unavailable", err);
+      return;
+    }
     recorder.ondataavailable = (e) => {
       if (e.data.size > 0) chunks.push(e.data);
     };
@@ -430,10 +449,19 @@ function CallPage({ initialTranscript = [] as Caption[] }: { initialTranscript?:
         return;
       }
       // One complete, valid webm file — header + all chunks in order.
-      ws.send(new Blob(chunks, { type: "audio/webm" }));
-      ws.send(JSON.stringify({ type: "end_utterance" }));
+      try {
+        ws.send(new Blob(chunks, { type: "audio/webm" }));
+        ws.send(JSON.stringify({ type: "end_utterance" }));
+      } catch {
+        // the socket closed between the state check and the send — ignore
+      }
     };
-    recorder.start(RECORDER_TIMESLICE_MS);
+    try {
+      recorder.start(RECORDER_TIMESLICE_MS);
+    } catch (err) {
+      console.error("[voice-call] recorder failed to start", err);
+      return;
+    }
     utteranceRecorderRef.current = recorder;
     utteranceCtlRef.current = {
       mark: (send: boolean) => {
@@ -505,50 +533,55 @@ function CallPage({ initialTranscript = [] as Caption[] }: { initialTranscript?:
 
       const data = new Uint8Array(analyser.fftSize);
       vadTimerRef.current = window.setInterval(() => {
-        analyser.getByteTimeDomainData(data);
-        let sum = 0;
-        for (let i = 0; i < data.length; i++) {
-          const v = (data[i] - 128) / 128;
-          sum += v * v;
-        }
-        const rms = Math.sqrt(sum / data.length);
-        const now = Date.now();
-        const st = stateRef.current;
-        const aiReplying = st === "speaking" || st === "thinking" || st === "transcribing";
-        // While the AI is talking the mic hears its own voice (echo), so
-        // interrupting needs a louder signal sustained over more frames.
-        // Hard mute: while AI audio is playing, skip VAD processing entirely.
-        if (hardMuteRef.current) {
-          vadSpeakingRef.current = false;
-          vadFramesRef.current = 0;
-          return;
-        }
-        const threshold = aiReplying ? VAD_BARGE_IN_THRESHOLD : VAD_RMS_THRESHOLD;
-        const onsetFrames = aiReplying ? VAD_BARGE_IN_FRAMES : VAD_ONSET_FRAMES;
-
-        if (rms > threshold) {
-          lastVoiceRef.current = now;
-          vadFramesRef.current += 1;
-        } else {
-          vadFramesRef.current = 0;
-        }
-
-        if (!vadSpeakingRef.current) {
-          // During the post-reply cooldown window, ignore onset detection so
-          // echo / room noise right after the AI speaks doesn't create a
-          // phantom utterance. Barge-in (interruption) still works normally.
-          const inCooldown = now < vadCooldownUntilRef.current;
-          if (vadFramesRef.current >= onsetFrames && (!inCooldown || aiReplying)) {
-            vadSpeakingRef.current = true;
-            if (aiReplying) bargeIn();
-            beginSegment();
+        try {
+          analyser.getByteTimeDomainData(data);
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) {
+            const v = (data[i] - 128) / 128;
+            sum += v * v;
           }
-        } else if (
-          now - lastVoiceRef.current >= VAD_SILENCE_LIMIT_MS ||
-          now - segmentStartRef.current >= VAD_MAX_SEGMENT_MS
-        ) {
-          vadSpeakingRef.current = false;
-          endSegment();
+          const rms = Math.sqrt(sum / data.length);
+          const now = Date.now();
+          const st = stateRef.current;
+          const aiReplying = st === "speaking" || st === "thinking" || st === "transcribing";
+          // While the AI is talking the mic hears its own voice (echo), so
+          // interrupting needs a louder signal sustained over more frames.
+          // Hard mute: while AI audio is playing, skip VAD processing entirely.
+          if (hardMuteRef.current) {
+            vadSpeakingRef.current = false;
+            vadFramesRef.current = 0;
+            return;
+          }
+          const threshold = aiReplying ? VAD_BARGE_IN_THRESHOLD : VAD_RMS_THRESHOLD;
+          const onsetFrames = aiReplying ? VAD_BARGE_IN_FRAMES : VAD_ONSET_FRAMES;
+
+          if (rms > threshold) {
+            lastVoiceRef.current = now;
+            vadFramesRef.current += 1;
+          } else {
+            vadFramesRef.current = 0;
+          }
+
+          if (!vadSpeakingRef.current) {
+            // During the post-reply cooldown window, ignore onset detection so
+            // echo / room noise right after the AI speaks doesn't create a
+            // phantom utterance. Barge-in (interruption) still works normally.
+            const inCooldown = now < vadCooldownUntilRef.current;
+            if (vadFramesRef.current >= onsetFrames && (!inCooldown || aiReplying)) {
+              vadSpeakingRef.current = true;
+              if (aiReplying) bargeIn();
+              beginSegment();
+            }
+          } else if (
+            now - lastVoiceRef.current >= VAD_SILENCE_LIMIT_MS ||
+            now - segmentStartRef.current >= VAD_MAX_SEGMENT_MS
+          ) {
+            vadSpeakingRef.current = false;
+            endSegment();
+          }
+        } catch (err) {
+          // One bad VAD tick must never kill the interval (or the call).
+          console.error("[voice-call] VAD tick failed", err);
         }
       }, VAD_TICK_MS);
     } catch {
@@ -571,8 +604,8 @@ function CallPage({ initialTranscript = [] as Caption[] }: { initialTranscript?:
 
   /** Tap the mic once — the call stays open and hands-free until you hang up. */
   const startCall = async () => {
-    if (!navigator.mediaDevices?.getUserMedia) {
-      toast.error("Microphone is not supported in this browser.");
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      toast.error("Microphone recording is not supported in this browser.");
       return;
     }
     stopPlayback();

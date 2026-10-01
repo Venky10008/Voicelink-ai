@@ -417,6 +417,12 @@ function VoicesPage({ voices: initialVoices, loading: initialLoading = false }: 
             <Badge className="bg-primary/20 text-primary border-primary/30 text-xs">AI · Free · Local</Badge>
           </div>
 
+          <p className="text-xs text-muted-foreground rounded-lg border border-border/60 bg-muted/30 px-3 py-2">
+            Cloning runs locally on this machine&apos;s GPU from your reference recording. For demo
+            stability the call uses a lightweight built-in voice fallback behind the scenes, so
+            selecting &quot;My Voice&quot; never fails live.
+          </p>
+
           {cloneLoading ? (
             <Skeleton className="h-44 rounded-2xl" />
           ) : myProfileId != null ? (

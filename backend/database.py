@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import ssl
 from urllib.parse import quote, urlparse
@@ -16,6 +17,14 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 load_dotenv()
+
+# DEMO_MODE read straight from the env (importing voice_call_ws here would be
+# circular). When true, an unreachable Postgres falls back to local SQLite so
+# a live demo never depends on the Supabase project being awake.
+DEMO_MODE = os.getenv("DEMO_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
+DEMO_SQLITE_URL = os.getenv("DEMO_SQLITE_URL", "sqlite+aiosqlite:///demo.db")
+# Hard cap (seconds) for the startup Postgres probe in DEMO_MODE.
+DEMO_DB_PROBE_TIMEOUT_S = float(os.getenv("DB_PROBE_TIMEOUT_S", "6"))
 
 _DEFAULT_URL = (
     "postgresql+asyncpg://postgres:YOUR_PASSWORD@db.YOUR_PROJECT_REF.supabase.co:5432/postgres"
@@ -81,6 +90,11 @@ if _needs_ssl(DATABASE_URL):
     _ssl_ctx.check_hostname = False
     _ssl_ctx.verify_mode = ssl.CERT_NONE
     _connect_args["ssl"] = _ssl_ctx
+if DEMO_MODE:
+    # Bound the startup probe: a paused/unreachable Supabase project must not
+    # stall the demo boot — fail fast (default asyncpg connect timeout is 60s)
+    # and drop straight to the local SQLite fallback.
+    _connect_args["timeout"] = float(os.getenv("DB_PROBE_TIMEOUT_S", "5"))
 
 engine = create_async_engine(
     DATABASE_URL,
@@ -110,17 +124,50 @@ async def get_db():
 
 
 async def init_db() -> None:
-    """Create tables if they do not exist (works on Supabase)."""
+    """Create tables if they do not exist (works on Supabase).
+
+    DEMO_MODE: when Postgres is unreachable (paused Supabase project, broken
+    URL…), fall back to a local SQLite database so the demo still runs
+    end-to-end — chat history, memory and voice profiles all keep working.
+    """
+    global engine
     from models import Message, User, UserMemory  # noqa: F401
     from models import UserSettings  # noqa: F401
     from models import VoicePermission, VoiceProfile  # noqa: F401
 
+    try:
+        if DEMO_MODE:
+            # Bound the WHOLE startup probe. asyncpg applies its own `timeout`
+            # to EVERY resolved IP, so a broken pooler host can otherwise burn
+            # 5-10× the per-attempt timeout before failing. wait_for caps the
+            # total — the demo boot never waits on a dead database.
+            conn = await asyncio.wait_for(
+                engine.connect(), timeout=DEMO_DB_PROBE_TIMEOUT_S
+            )
+            await conn.close()
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            if engine.dialect.name == "postgresql":
+                # Idempotent migration for the pre-existing `messages` table
+                # (Postgres-only syntax — skipped on the SQLite fallback).
+                await conn.execute(
+                    text(
+                        "ALTER TABLE messages ADD COLUMN IF NOT EXISTS source "
+                        "VARCHAR(16) NOT NULL DEFAULT 'chat'"
+                    )
+                )
+        return
+    except Exception as exc:
+        if not DEMO_MODE:
+            raise
+        print(
+            f"[db] DEMO_MODE: Postgres unavailable ({type(exc).__name__}: {exc}) — "
+            f"falling back to local SQLite ({DEMO_SQLITE_URL})",
+            flush=True,
+        )
+
+    engine = create_async_engine(DEMO_SQLITE_URL, echo=False)
+    AsyncSessionLocal.configure(bind=engine)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Idempotent migration for the pre-existing `messages` table.
-        await conn.execute(
-            text(
-                "ALTER TABLE messages ADD COLUMN IF NOT EXISTS source "
-                "VARCHAR(16) NOT NULL DEFAULT 'chat'"
-            )
-        )
+    print("[db] DEMO_MODE: local SQLite database ready.", flush=True)

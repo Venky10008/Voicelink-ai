@@ -1,0 +1,50 @@
+# ── Critical: keep the build context tiny ─────────────────────────────────────
+# Without this, `COPY . .` uploads the local virtualenvs (~10 GB) to the Docker
+# daemon. HF Spaces builds would time out or run out of disk.
+
+# Virtualenvs (local dev only — never inside the image)
+.venv/
+venv/
+voice-venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Secrets — must be provided as env vars on the host, never baked in
+.env
+.env.local
+firebase-service-account.json
+*-firebase-adminsdk-*.json
+google-services.json
+
+# Local data / models / debug output
+data/
+debug_audio/
+demo.db
+*.db
+*.sqlite3
+models/
+
+# Cloned-voice speaker embeddings produced at runtime
+backend/data/
+
+# Logs and scratch files
+*.log
+*.err
+boot_result*.txt
+phases.txt
+probe_result.txt
+importslow.txt
+dev_result*.txt
+tsc_out*.txt
+tsc_result.txt
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

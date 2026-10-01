@@ -8,6 +8,13 @@ project/
 └── frontend/            # TanStack Start + React + TypeScript web UI (UI-only, API wiring in progress)
 ```
 
+> **Deploying?** See [DEPLOYMENT.md](DEPLOYMENT.md) — frontend to Vercel, backend to a
+> free CPU host (Hugging Face Spaces or Render). They deploy separately.
+
+> **Voice cloning:** see `backend/requirements-voice.txt`. `transformers` **must**
+> be `>=5.3.0`, otherwise the UI shows "Voice cloning engine not available".
+
+
 ---
 
 ## 1. Create a free Firebase project
@@ -93,20 +100,29 @@ pip install torch torchaudio
 
 #### XTTS v2 (fallback)
 
-The XTTS v2 engine needs PyTorch (Python 3.11/3.12). The project's `backend/voice-venv`
-(Python 3.11) already has it installed and the XTTS v2 model downloaded, so cloning
-works out of the box when the backend runs from that venv:
+The XTTS v2 engine needs PyTorch (Python 3.11/3.12) **and** `transformers>=5.3.0`.
+Install it with:
 
 ```powershell
 cd c:\Users\polav\Desktop\project\backend
-.\voice-venv\Scripts\Activate.ps1   # Python 3.11 venv (coqui-tts + torch already installed)
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+.\voice-venv\Scripts\Activate.ps1   # Python 3.11 venv
+pip install -r requirements-voice.txt
 ```
 
-If neither engine is available (e.g. the backend runs on newer Python), cloned voices
-gracefully fall back to Edge TTS so calls always work — `/health` shows the truth
-under `voice_clone_engine` ("omnivoice (local, free, 600+ languages)" vs
-"xtts-v2 (local, free)" vs "not installed").
+> `coqui-tts` 0.27.5 needs **FFmpeg + torchcodec** for audio I/O on torch >= 2.9.
+> Without them it raises at *import* time, so use `pip install coqui-tts[codec]`
+> (or `pip install torchcodec`). `voice_clone_engine.py` patches XTTS to read
+> reference audio via `soundfile` instead of torchaudio, so cloning works without
+> extra installs *once torchcodec is present*.
+
+If neither engine is available, cloned voices gracefully fall back to Edge TTS so
+calls always work — `/health` shows the truth under `voice_clone_engine`.
+
+> **Version trap:** if `/permissions` shows "Voice cloning engine not available",
+> it is almost always a `transformers` version mismatch, not a missing package.
+> Both OmniVoice and Coqui XTTS import `HiggsAudioV2TokenizerModel`, which only
+> exists from **transformers 5.3.0**. On 5.2.0 both engines fail to import.
+> See `backend/requirements-voice.txt`.
 
 > Windows note: torchaudio's torchcodec backend often can't load its FFmpeg DLLs
 > (`Could not load libtorchcodec`). `voice_clone_engine.py` detects this and

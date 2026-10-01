@@ -40,6 +40,15 @@ Server → client:
     {"type": "done", "emotion", "fresh_start", "notice"}
     {"type": "error", "detail": "..."}
     {"type": "pong"}
+
+Demo mode (DEMO_MODE=true)
+--------------------------
+Set DEMO_MODE=true in backend/.env for a bullet-proof live demo: every reply
+is synthesized by Microsoft Edge TTS (fast, free, no model downloads) and the
+local cloning engines (Chatterbox / OmniVoice / XTTS) are never touched.
+Cloned "My Voice" profiles stay selectable in the UI — they simply route
+through Edge TTS behind the scenes — and every failure (STT, LLM, TTS, voice
+resolution) falls back to a safe default instead of erroring mid-call.
 """
 
 from __future__ import annotations
@@ -50,6 +59,25 @@ import os
 import re
 import time
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load the backend .env before reading DEMO_MODE so the flag is correct no
+# matter how this module gets imported (main.py also calls this — repeated
+# loads are harmless and never override already-set environment variables).
+load_dotenv()
+
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    """Parse a boolean env flag ("1/true/yes/on" → True)."""
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# DEMO_MODE=true → every reply is spoken by Microsoft Edge TTS (fast, free,
+# reliable). Chatterbox / OmniVoice / XTTS are skipped entirely, and cloned
+# voices ("My Voice") stay selectable but route through Edge TTS behind the
+# scenes — so a live demo can never hang inside a GPU model or crash on stage.
+DEMO_MODE = _env_flag("DEMO_MODE", "false")
 
 from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
@@ -95,6 +123,17 @@ DEBUG_AUDIO_DIR = os.getenv("VOICELINK_DEBUG_AUDIO_DIR", "").strip()
 # default voice spoke instead — the fallback is never silent.
 VOICE_FALLBACK_NOTICE_DETAIL = "Voice cloning failed, using default voice"
 
+# Spoken instead of an error frame when the LLM stream fails before producing
+# any tokens — the call keeps going instead of showing "Something went wrong".
+LLM_FALLBACK_REPLY = (
+    "Sorry, I had a small hiccup just now. Could you say that again?"
+)
+
+# Hard ceilings so a stalled STT provider can never freeze a turn: the turn is
+# dropped with status "idle" and the user simply speaks again.
+STT_GROQ_TIMEOUT_S = 20.0
+STT_LOCAL_TIMEOUT_S = 60.0
+
 
 async def send_voice_fallback_notice(websocket: WebSocket) -> None:
     """Tell the client the cloned voice could not be used for this turn."""
@@ -123,57 +162,91 @@ async def resolve_voice_config(
 
     Cloned voices verify live permission; built-in voices must exist.
     Returns (tts_voice_id, cloned_voice_key) — exactly what synthesis needs.
+
+    DEMO_MODE: a cloned "My Voice" profile that cannot be resolved (DB down,
+    lost permission, deleted profile…) must never fail the call — it logs and
+    falls back to the default Edge voice instead (the cloning engines are
+    skipped in the synthesis path anyway).
     """
     tts_voice_id: str | None = None
     cloned_voice_key: str | None = None
 
     if voice_profile_id is not None:
-        vp = await get_voice_profile_by_id(db, profile_id=voice_profile_id)
-        if vp is None or vp.status == "deleted":
-            raise HTTPException(
-                status_code=404,
-                detail=f"Voice profile {voice_profile_id} not found or has been deleted.",
-            )
-        firebase_uid = firebase_user.get("uid")
-        if not firebase_uid:
-            raise HTTPException(
-                status_code=401,
-                detail="Firebase token is missing a user id (uid).",
-            )
         try:
-            requester = await get_or_create_user(
-                db,
-                firebase_uid=firebase_uid,
-                name=display_name(firebase_user),
-            )
-        except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Database error while resolving user: {exc}",
-            ) from exc
-
-        cloned_voice_key = vp.cloned_voice_key
-        if vp.owner_user_id != requester.id:
-            approved = await get_approved_permission(
-                db,
-                voice_profile_id=voice_profile_id,
-                requester_user_id=requester.id,
-            )
-            if approved is None:
+            vp = await get_voice_profile_by_id(db, profile_id=voice_profile_id)
+            if vp is None or vp.status == "deleted":
                 raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        "You do not have approved access to this cloned voice. "
-                        "Request access from the voice owner and wait for approval."
-                    ),
+                    status_code=404,
+                    detail=f"Voice profile {voice_profile_id} not found or has been deleted.",
                 )
+            firebase_uid = firebase_user.get("uid")
+            if not firebase_uid:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Firebase token is missing a user id (uid).",
+                )
+            try:
+                requester = await get_or_create_user(
+                    db,
+                    firebase_uid=firebase_uid,
+                    name=display_name(firebase_user),
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Database error while resolving user: {exc}",
+                ) from exc
+
+            cloned_voice_key = vp.cloned_voice_key
+            if vp.owner_user_id != requester.id:
+                approved = await get_approved_permission(
+                    db,
+                    voice_profile_id=voice_profile_id,
+                    requester_user_id=requester.id,
+                )
+                if approved is None:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=(
+                            "You do not have approved access to this cloned voice. "
+                            "Request access from the voice owner and wait for approval."
+                        ),
+                    )
+        except HTTPException:
+            if not DEMO_MODE:
+                raise
+            print(
+                f"[voice-call] DEMO_MODE: cloned voice profile {voice_profile_id} "
+                "unavailable — speaking with the default Edge voice instead",
+                flush=True,
+            )
+            return None, None
+        except Exception as exc:
+            if not DEMO_MODE:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Database error while resolving voice: {exc}",
+                ) from exc
+            print(
+                f"[voice-call] DEMO_MODE: voice lookup failed ({exc}) — "
+                "speaking with the default Edge voice instead",
+                flush=True,
+            )
+            return None, None
     elif voice_id is not None:
         builtin = get_builtin_voice(voice_id)
         if builtin is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown voice id '{voice_id}'.",
+            if not DEMO_MODE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown voice id '{voice_id}'.",
+                )
+            print(
+                f"[voice-call] DEMO_MODE: unknown voice id '{voice_id}' — "
+                "speaking with the default Edge voice instead",
+                flush=True,
             )
+            return None, None
         tts_voice_id = builtin["edge_tts_voice"]
 
     return tts_voice_id, cloned_voice_key
@@ -240,13 +313,25 @@ async def _handle_turn(
         return "n/a" if a is None or b is None else f"{(b - a) * 1000:.0f}ms"
 
     try:
-        # ---- resolve voice (same permission rules as /voice-chat) ----
-        tts_voice_id, cloned_voice_key = await resolve_voice_config(
-            db,
-            firebase_user,
-            voice_profile_id=config.get("voice_profile_id"),
-            voice_id=config.get("voice_id"),
-        )
+        # ---- resolve voice (same permission rules as /voice-chat).
+        # Belt-and-braces: even if resolution somehow raises, DEMO_MODE must
+        # keep the call alive — fall back to the default Edge voice. ----
+        try:
+            tts_voice_id, cloned_voice_key = await resolve_voice_config(
+                db,
+                firebase_user,
+                voice_profile_id=config.get("voice_profile_id"),
+                voice_id=config.get("voice_id"),
+            )
+        except Exception:
+            if not DEMO_MODE:
+                raise
+            print(
+                "[voice-call] DEMO_MODE: voice resolution failed — "
+                "using the default Edge voice",
+                flush=True,
+            )
+            tts_voice_id, cloned_voice_key = None, None
         if session["cancelled"]:
             return
 
@@ -281,17 +366,31 @@ async def _handle_turn(
         # missing or the request fails. Both paths receive the SAME explicit
         # language so neither can mis-detect. ----
         await websocket.send_json({"type": "status", "state": "transcribing"})
-        transcript = await transcribe_audio_groq(audio_bytes, "recording.webm", language=lang)
+        transcript = None
+        try:
+            # Hard timeout: a stalled Groq request must never freeze the turn.
+            transcript = await asyncio.wait_for(
+                transcribe_audio_groq(audio_bytes, "recording.webm", language=lang),
+                timeout=STT_GROQ_TIMEOUT_S,
+            )
+        except Exception as exc:
+            print(f"[stt] Groq transcription error: {exc}", flush=True)
         if not transcript:
-            transcript = (
-                await transcribe_audio(
-                    audio_bytes,
-                    "recording.webm",
-                    beam_size=1,
-                    condition_on_previous_text=False,
-                    language=lang,
-                )
-            ).strip()
+            try:
+                transcript = (
+                    await asyncio.wait_for(
+                        transcribe_audio(
+                            audio_bytes,
+                            "recording.webm",
+                            beam_size=1,
+                            condition_on_previous_text=False,
+                            language=lang,
+                        ),
+                        timeout=STT_LOCAL_TIMEOUT_S,
+                    )
+                ).strip()
+            except Exception as exc:
+                print(f"[stt] Local Whisper error: {exc}", flush=True)
         t_stt_done = time.perf_counter()
         if session["cancelled"]:
             return
@@ -354,7 +453,36 @@ async def _handle_turn(
             # right voice/phonemes sentence-by-sentence.
             s_lang = detect_language(sentence)
 
-            if cloned_voice_key is not None:
+            if DEMO_MODE:
+                # Demo mode: Edge TTS only — fast, reliable, free.
+                # Cloned voices route here too, so "My Voice" stays selectable
+                # but can never fail live (cloning runs locally on GPU; this
+                # is the lighter demo-stability fallback).
+                try:
+                    audio_data, mime_type = await synthesize_speech(
+                        sentence,
+                        voice_id=tts_voice_id,
+                        speed=s_speed,
+                        pitch=s_pitch,
+                        language=s_lang,
+                    )
+                except Exception as exc:
+                    # One quiet retry with the explicit default voice — a
+                    # transient Edge TTS hiccup must not lose a sentence.
+                    print(
+                        f"[voice-call] DEMO_MODE Edge TTS failed "
+                        f"({type(exc).__name__}: {exc}) — retrying once",
+                        flush=True,
+                    )
+                    await asyncio.sleep(0.25)
+                    audio_data, mime_type = await synthesize_speech(
+                        sentence,
+                        voice_id=None,
+                        speed=s_speed,
+                        pitch=s_pitch,
+                        language=s_lang,
+                    )
+            elif cloned_voice_key is not None:
                 # Chatterbox preferred (500M model, 23+ languages);
                 # XTTS v2 fallback for unsupported languages (te/ta) or failures.
                 try:
@@ -490,6 +618,29 @@ async def _handle_turn(
                 for piece in split_sentences(tail):
                     if piece:
                         enqueue_sentence(piece)
+        except _TurnCancelled:
+            worker_task.cancel()
+            raise  # client hung up mid-reply — drop the turn silently
+        except Exception as exc:
+            # The LLM stream failed (Groq outage/timeout, DB hiccup…). Never
+            # surface a raw error mid-call: if nothing has been said yet, speak
+            # a short canned recovery line through Edge TTS so the turn still
+            # produces audio; otherwise finish with whatever already streamed.
+            print(
+                f"[voice-call] LLM stream failed ({type(exc).__name__}): {exc}",
+                flush=True,
+            )
+            if not tokens:
+                tokens.append(LLM_FALLBACK_REPLY)
+                try:
+                    await websocket.send_json(
+                        {"type": "token", "content": LLM_FALLBACK_REPLY}
+                    )
+                except Exception:
+                    pass  # socket gone — the reply just isn't shown
+                for piece in split_sentences(LLM_FALLBACK_REPLY):
+                    if piece:
+                        enqueue_sentence(piece)
         except BaseException:
             worker_task.cancel()
             raise
@@ -536,7 +687,12 @@ async def _handle_turn(
         pass  # client hung up mid-reply — drop the turn silently
     except HTTPException as exc:
         try:
-            await websocket.send_json({"type": "error", "detail": exc.detail})
+            if DEMO_MODE:
+                # Never surface setup errors mid-demo — just keep listening.
+                print(f"[voice-call] DEMO_MODE: turn error ({exc.detail}) — back to listening", flush=True)
+                await websocket.send_json({"type": "status", "state": "idle"})
+            else:
+                await websocket.send_json({"type": "error", "detail": exc.detail})
         except Exception:
             pass
     except WebSocketDisconnect:
@@ -544,9 +700,14 @@ async def _handle_turn(
     except Exception as exc:
         print(f"[voice-call] turn failed: {exc}", flush=True)
         try:
-            await websocket.send_json(
-                {"type": "error", "detail": "Something went wrong during the call."}
-            )
+            if DEMO_MODE:
+                # The demo must never show "Something went wrong" on stage.
+                # Fall back to listening; the user simply speaks again.
+                await websocket.send_json({"type": "status", "state": "idle"})
+            else:
+                await websocket.send_json(
+                    {"type": "error", "detail": "Something went wrong during the call."}
+                )
         except Exception:
             pass
 
@@ -621,8 +782,17 @@ async def handle_voice_call(websocket: WebSocket, db, firebase_user: dict) -> No
                     )
                     await websocket.send_json({"type": "ready"})
                 except HTTPException as exc:
-                    await websocket.send_json({"type": "error", "detail": exc.detail})
-                    break
+                    if not DEMO_MODE:
+                        await websocket.send_json({"type": "error", "detail": exc.detail})
+                        break
+                    # DEMO_MODE: a voice that can't be resolved must not kill
+                    # the call — the turn speaks with the default Edge voice.
+                    print(
+                        f"[voice-call] DEMO_MODE: config voice unavailable "
+                        f"({exc.detail}) — default Edge voice will be used",
+                        flush=True,
+                    )
+                    await websocket.send_json({"type": "ready"})
             elif kind == "end_utterance":
                 if session["config"] is None:
                     continue

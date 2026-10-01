@@ -9,9 +9,27 @@ asyncpg>=0.30.0
 python-multipart>=0.0.20
 faster-whisper>=1.1.0
 edge-tts>=7.2.0
+# Local SQLite fallback used by DEMO_MODE when Postgres/Supabase is unreachable
+aiosqlite>=0.20.0
 # Chatterbox TTS (free, open-source voice cloning, MIT licensed)
 chatterbox-tts>=0.1.7
 torch>=2.0.0
 torchaudio>=2.0.0
 # Note: First run of faster-whisper with large-v3-turbo downloads ~809 MB model
 # For better Telugu/Indian language accuracy, use large-v3-turbo instead of small
+
+# ── Voice cloning engines (optional) ──────────────────────────────────────────
+# Kept in a separate file on purpose: these pull in torch + transformers
+# (~2 GB) and are NOT needed for text chat, Edge TTS, or Whisper STT.
+# Install with:  pip install -r requirements-voice.txt
+#
+# Why these exact pins:
+#   transformers must be >= 5.3.0. omnivoice 0.2.1 declares transformers>=5.3.0,
+#   and both omnivoice and coqui-tts import `HiggsAudioV2TokenizerModel`, which
+#   only exists from transformers 5.3.0 onward. With 5.2.0 installed both engines
+#   fail to import and /voice/my-permissions reports
+#   clone_engine_available=false ("Voice cloning engine not available").
+# omnivoice==0.2.1
+# coqui-tts==0.27.5
+# transformers==5.18.0
+

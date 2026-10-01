@@ -313,6 +313,9 @@ async def synthesize_cloned_voice(
     Multilingual V3 supports 23+ languages. For unsupported languages
     (te, ta), the caller must fall back to another engine.
     """
+    # Declared up-front (global reads/writes below): Python forbids using a
+    # name before its `global` declaration in the same function scope.
+    global _colab_reachable
     ref_wav_path = _ref_wav_path(voice_key)
     if not ref_wav_path.exists():
         raise HTTPException(
@@ -337,7 +340,6 @@ async def synthesize_cloned_voice(
             return await _synthesize_via_colab(text, ref_wav_path, language, speed)
         except VoiceCloneUnavailableError:
             # Colab unreachable — mark it and fall through to local
-            global _colab_reachable
             _colab_reachable = False
             print(
                 "[CHATTERBOX] Colab unreachable, falling back to local GPU",
