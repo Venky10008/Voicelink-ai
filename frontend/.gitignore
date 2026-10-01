@@ -20,6 +20,9 @@ dist-ssr
 .wrangler/
 .dev.vars
 
+# Vercel build output (Build Output API v3) + local project link
+.vercel
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
