@@ -260,9 +260,6 @@ Default dev URL: http://localhost:3000
 | `/history` | Conversation history (mock data) |
 | `/profile` | Profile & settings |
 
-> Note: this repo is connected to [Lovable](https://lovable.dev) — avoid force-pushing
-> or rewriting published git history on the frontend repo.
-
 ### Connecting to the local backend
 
 - The backend runs at `http://127.0.0.1:8000`.
